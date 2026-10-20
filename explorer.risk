@@ -1,0 +1,735 @@
+// explorer - Risk File Explorer
+
+
+//   Commands
+//   Up/Down  j/k    move            PgUp/PgDn   page
+//   Enter/Right/l   open dir/file   Left/Bksp/h parent directory
+//   g / G           first / last    ~           home directory
+//   .               toggle hidden   s           sort name <-> size
+//   p               toggle preview  r / F5      refresh
+//   n               new directory   f           new file
+//   m               rename          d           delete (asks y/n)
+//   e               edit in $EDITOR ?           help
+//   q / Ctrl-C      quit
+
+import "@core";
+import "@os";
+import "@tui";
+
+block Entry {
+    name:  string;
+    isDir: bool;
+    size:  i64;
+}
+
+g_w: i32 = 80;
+g_h: i32 = 24;
+g_path: string = "";
+g_sel: i32 = 0;
+g_scroll: i32 = 0;
+g_hidden: bool = false;
+g_preview: bool = true;
+g_sort: i32 = 0;
+g_mode: i32 = 0;
+g_promptKind: i32 = 0;
+g_input: string = "";
+g_msg: string = "";
+g_msgIsErr: bool = false;
+g_dirty: bool = true;
+g_entries: Array<Entry> = [];
+g_prevFor: string = "";
+g_prev: Array<string> = [];
+
+func streq(a: string, b: string) -> bool {
+    n: i32 = strLength(a);
+    if (n != strLength(b)) { return false; }
+    i: i32 = 0;
+    while (i < n) {
+        if (charToInt(strCharAt(a, i)) != charToInt(strCharAt(b, i))) { return false; }
+        i++;
+    }
+    return true;
+}
+
+func byteAt(s: string, i: i32) -> i32 {
+    b: i32 = charToInt(strCharAt(s, i));
+    if (b < 0) { b = b + 256; }
+    return b;
+}
+
+func lessLower(a: string, b: string) -> bool {
+    la: i32 = strLength(a);
+    lb: i32 = strLength(b);
+    n: i32 = la;
+    if (lb < n) { n = lb; }
+    i: i32 = 0;
+    while (i < n) {
+        ca: i32 = byteAt(a, i);
+        cb: i32 = byteAt(b, i);
+        if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+        if (ca != cb) { return ca < cb; }
+        i++;
+    }
+    return la < lb;
+}
+
+func repeatStr(s: string, n: i32) -> string {
+    out: string = "";
+    i: i32 = 0;
+    while (i < n) {
+        out = strConcat(out, s);
+        i++;
+    }
+    return out;
+}
+
+func shellQuote(s: string) -> string {
+    return strConcat(strConcat("'", strReplace(s, "'", "'\\''")), "'");
+}
+
+func lastCharIs(s: string, code: i32) -> bool {
+    n: i32 = strLength(s);
+    if (n == 0) { return false; }
+    return byteAt(s, n - 1) == code;
+}
+
+func put(buf: Buffer, row: i32, col: i32, maxw: i32, s: string,
+         fg: i32, bg: i32, attr: i32) -> i32 {
+    n: i32 = strLength(s);
+    i: i32 = 0;
+    cells: i32 = 0;
+    while (i < n && cells < maxw) {
+        b: i32 = byteAt(s, i);
+        cp: i32 = b;
+        step: i32 = 1;
+        if (b >= 240 && i + 3 < n) {
+            cp = (b - 240) * 262144 + (byteAt(s, i + 1) - 128) * 4096
+                 + (byteAt(s, i + 2) - 128) * 64 + (byteAt(s, i + 3) - 128);
+            step = 4;
+        } else {
+            if (b >= 224 && i + 2 < n) {
+                cp = (b - 224) * 4096 + (byteAt(s, i + 1) - 128) * 64
+                     + (byteAt(s, i + 2) - 128);
+                step = 3;
+            } else {
+                if (b >= 192 && i + 1 < n) {
+                    cp = (b - 192) * 64 + (byteAt(s, i + 1) - 128);
+                    step = 2;
+                } else {
+                    if (b >= 128) { cp = 63; }
+                }
+            }
+        }
+        if (cp < 32 || cp == 127) { cp = 46; }
+        tuiBufferSet(buf, row, col + cells, cp, fg, bg, attr);
+        cells++;
+        i = i + step;
+    }
+    return cells;
+}
+
+func cellLen(s: string) -> i32 {
+    n: i32 = strLength(s);
+    i: i32 = 0;
+    c: i32 = 0;
+    while (i < n) {
+        b: i32 = byteAt(s, i);
+        if (b < 128 || b >= 192) { c++; }
+        i++;
+    }
+    return c;
+}
+
+func fmtSize(n: i64) -> string {
+    if (n < 0) { return "?"; }
+    if (n < 1024) { return strConcat(toString(cast<i32>(n)), " B"); }
+    units: Array<string> = [" KB", " MB", " GB", " TB"];
+    v: i64 = n;
+    u: i32 = -1;
+    frac: i64 = 0;
+    while (v >= 1024 && u < 3) {
+        frac = ((v % 1024) * 10) / 1024;
+        v = v / 1024;
+        u++;
+    }
+    out: string = toString(cast<i32>(v));
+    if (v < 100) {
+        out = strConcat(strConcat(out, "."), toString(cast<i32>(frac)));
+    }
+    return strConcat(out, units[u]);
+}
+
+func two(n: i32) -> string {
+    if (n < 10) { return strConcat("0", toString(n)); }
+    return toString(n);
+}
+
+func fmtDate(t: i64) -> string {
+    if (t <= 0) { return "-"; }
+    days: i64 = t / 86400;
+    secs: i64 = t % 86400;
+    z: i64 = days + 719468;
+    era: i64 = z / 146097;
+    doe: i64 = z - era * 146097;
+    yoe: i64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y: i64 = yoe + era * 400;
+    doy: i64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp: i64 = (5 * doy + 2) / 153;
+    d: i64 = doy - (153 * mp + 2) / 5 + 1;
+    m: i64 = mp + 3;
+    if (m > 12) { m = m - 12; }
+    if (m <= 2) { y = y + 1; }
+    hh: i32 = cast<i32>(secs / 3600);
+    mm: i32 = cast<i32>((secs % 3600) / 60);
+    out: string = strConcat(toString(cast<i32>(y)), "-");
+    out = strConcat(out, strConcat(two(cast<i32>(m)), "-"));
+    out = strConcat(out, strConcat(two(cast<i32>(d)), " "));
+    out = strConcat(out, strConcat(two(hh), strConcat(":", two(mm))));
+    return strConcat(out, " UTC");
+}
+
+func entryBefore(a: Entry, b: Entry) -> bool {
+    if (a.isDir && !b.isDir) { return true; }
+    if (!a.isDir && b.isDir) { return false; }
+    if (g_sort == 1 && !a.isDir) {
+        if (a.size != b.size) { return a.size > b.size; }
+    }
+    return lessLower(a.name, b.name);
+}
+
+func swapEntries(a: ptr<Entry>, b: ptr<Entry>) -> void {
+    t: Entry = *a;
+    *a = *b;
+    *b = t;
+}
+
+func sortRange(arr: ptr<Array<Entry>>, low: i32, high: i32) -> void {
+    if (low >= high) { return; }
+    pivot: Entry = (*arr)[high];
+    i: i32 = low - 1;
+    j: i32 = low;
+    while (j < high) {
+        if (entryBefore((*arr)[j], pivot)) {
+            i++;
+            swapEntries(&(*arr)[i], &(*arr)[j]);
+        }
+        j++;
+    }
+    swapEntries(&(*arr)[i + 1], &(*arr)[high]);
+    sortRange(arr, low, i);
+    sortRange(arr, i + 2, high);
+}
+
+func setMsg(text: string, isErr: bool) -> void {
+    g_msg = text;
+    g_msgIsErr = isErr;
+    g_dirty = true;
+}
+
+func fullPath(name: string) -> string {
+    return pathJoin(g_path, name);
+}
+
+func selectedEntry() -> Entry {
+    e: Entry = {"", false, 0};
+    if (g_sel >= 0 && g_sel < length(g_entries)) {
+        e = g_entries[g_sel];
+    }
+    return e;
+}
+
+func listHeight() -> i32 {
+    h: i32 = g_h - 4;
+    if (h < 1) { h = 1; }
+    return h;
+}
+
+func clampSelection() -> void {
+    n: i32 = length(g_entries);
+    if (g_sel >= n) { g_sel = n - 1; }
+    if (g_sel < 0) { g_sel = 0; }
+    lh: i32 = listHeight();
+    if (g_sel < g_scroll) { g_scroll = g_sel; }
+    if (g_sel >= g_scroll + lh) { g_scroll = g_sel - lh + 1; }
+    if (g_scroll < 0) { g_scroll = 0; }
+    g_prevFor = "";
+    g_dirty = true;
+}
+
+func reload(keepName: string) -> void {
+    names: Array<string> = fsListDir(g_path);
+    g_entries = [];
+    i: i32 = 0;
+    while (i < length(names)) {
+        nm: string = names[i];
+        i++;
+        if (strLength(nm) == 0) { continue; }
+        if (!g_hidden && byteAt(nm, 0) == 46) { continue; }
+        full: string = fullPath(nm);
+        isDir: bool = fsIsDir(full);
+        sz: i64 = 0;
+        if (!isDir) { sz = fsFileSize(full); }
+        e: Entry = {nm, isDir, sz};
+        g_entries.push(e);
+    }
+    n: i32 = length(g_entries);
+    if (n > 1) { sortRange(&g_entries, 0, n - 1); }
+
+    g_sel = 0;
+    if (strLength(keepName) > 0) {
+        k: i32 = 0;
+        while (k < n) {
+            if (streq(g_entries[k].name, keepName)) { g_sel = k; break; }
+            k++;
+        }
+    }
+    g_scroll = 0;
+    clampSelection();
+}
+
+func gotoDir(path: string, keepName: string) -> void {
+    target: string = pathAbsolute(path);
+    if (!fsIsDir(target)) {
+        setMsg(strConcat("Not a directory: ", path), true);
+        return;
+    }
+    g_path = target;
+    reload(keepName);
+    setMsg("", false);
+}
+
+func goParent() -> void {
+    cur: string = g_path;
+    parent: string = pathDir(cur);
+    if (streq(parent, cur)) { return; }
+    gotoDir(parent, pathBase(cur));
+}
+
+func runExternal(cmd: string) -> void {
+    tuiCleanup();
+    procSystem(cmd);
+    tuiSetup();
+    g_dirty = true;
+}
+
+func openSelected() -> void {
+    e: Entry = selectedEntry();
+    if (strLength(e.name) == 0) { return; }
+    full: string = fullPath(e.name);
+    if (e.isDir) {
+        gotoDir(full, "");
+    } else {
+        runExternal(strConcat("${PAGER:-less} ", shellQuote(full)));
+    }
+}
+
+func editSelected() -> void {
+    e: Entry = selectedEntry();
+    if (strLength(e.name) == 0 || e.isDir) { return; }
+    runExternal(strConcat("${EDITOR:-vi} ", shellQuote(fullPath(e.name))));
+}
+
+func queryTermSize() -> bool {
+    tmp: string = pathJoin(fsTempDir(), "risk_fe_size.txt");
+    cmd: string = strConcat(strConcat("stty size < /dev/tty > ", shellQuote(tmp)), " 2>/dev/null");
+    procSystem(cmd);
+    if (!fsIsFile(tmp)) { return false; }
+    parts: Array<string> = strSplit(strTrim(fioRead(tmp)), " ");
+    fsRemoveFile(tmp);
+    if (length(parts) != 2) { return false; }
+    h: i32 = toInt(parts[0]);
+    w: i32 = toInt(parts[1]);
+    if (w < 40 || h < 10) { return false; }
+    if (w == g_w && h == g_h) { return false; }
+    g_w = w;
+    g_h = h;
+    return true;
+}
+
+func moveSel(delta: i32) -> void {
+    g_sel = g_sel + delta;
+    clampSelection();
+}
+
+func applyPrompt() -> void {
+    name: string = strTrim(g_input);
+    g_mode = 0;
+    g_dirty = true;
+    if (strLength(name) == 0) { setMsg("Cancelled", false); return; }
+    if (g_promptKind == 1) {
+        if (fsMkdir(fullPath(name))) {
+            reload(name);
+            setMsg(strConcat("Created directory ", name), false);
+        } else {
+            setMsg(strConcat("Could not create ", name), true);
+        }
+    }
+    if (g_promptKind == 2) {
+        if (fsExists(fullPath(name))) {
+            setMsg(strConcat("Already exists: ", name), true);
+        } else {
+            if (fioWrite(fullPath(name), "")) {
+                reload(name);
+                setMsg(strConcat("Created file ", name), false);
+            } else {
+                setMsg(strConcat("Could not create ", name), true);
+            }
+        }
+    }
+    if (g_promptKind == 3) {
+        e: Entry = selectedEntry();
+        if (fsRename(fullPath(e.name), fullPath(name))) {
+            reload(name);
+            setMsg(strConcat(strConcat(e.name, " -> "), name), false);
+        } else {
+            setMsg("Rename failed", true);
+        }
+    }
+}
+
+func startPrompt(kind: i32, initial: string) -> void {
+    g_mode = 1;
+    g_promptKind = kind;
+    g_input = initial;
+    g_dirty = true;
+}
+
+func doDelete() -> void {
+    e: Entry = selectedEntry();
+    g_mode = 0;
+    full: string = fullPath(e.name);
+    ok: bool = false;
+    if (e.isDir) { ok = fsRemoveAll(full); } else { ok = fsRemoveFile(full); }
+    if (ok) {
+        keep: i32 = g_sel;
+        reload("");
+        g_sel = keep;
+        clampSelection();
+        setMsg(strConcat("Deleted ", e.name), false);
+    } else {
+        setMsg(strConcat("Could not delete ", e.name), true);
+    }
+}
+
+func looksBinary(s: string) -> bool {
+    n: i32 = strLength(s);
+    if (n > 512) { n = 512; }
+    i: i32 = 0;
+    while (i < n) {
+        if (byteAt(s, i) == 0) { return true; }
+        i++;
+    }
+    return false;
+}
+
+func buildPreview() -> void {
+    e: Entry = selectedEntry();
+    key: string = fullPath(e.name);
+    if (streq(key, g_prevFor)) { return; }
+    g_prevFor = key;
+    g_prev = [];
+    if (strLength(e.name) == 0) { return; }
+    if (e.isDir) {
+        kids: Array<string> = fsListDir(key);
+        g_prev.push(strConcat(toString(length(kids)), " item(s)"));
+        g_prev.push("");
+        k: i32 = 0;
+        while (k < length(kids) && k < 200) {
+            g_prev.push(kids[k]);
+            k++;
+        }
+        return;
+    }
+    if (e.size == 0) { g_prev.push("(empty file)"); return; }
+    if (e.size > 2000000) { g_prev.push("(file too large to preview)"); return; }
+    text: string = fioRead(key);
+    if (looksBinary(text)) { g_prev.push("(binary file)"); return; }
+    if (strLength(text) > 6000) { text = strSubstr(text, 0, 6000); }
+    lines: Array<string> = strSplit(text, "\n");
+    k2: i32 = 0;
+    while (k2 < length(lines) && k2 < 200) {
+        g_prev.push(lines[k2]);
+        k2++;
+    }
+}
+
+func fillRow(buf: Buffer, row: i32, fg: i32, bg: i32, attr: i32) -> void {
+    tuiBufferFill(buf, row, 0, g_w, 1, 32, fg, bg, attr);
+}
+
+func drawHelp(buf: Buffer) -> void {
+    lines: Array<string> = [
+        "  Navigation",
+        "    Up/Down, j/k      move selection",
+        "    PgUp/PgDn         move one page",
+        "    g / G             first / last entry",
+        "    Enter, Right, l   open directory (files open in $PAGER)",
+        "    Left, Bksp, h     go to parent directory",
+        "    ~                 go to home directory",
+        "",
+        "  Actions",
+        "    n  new directory      f  new file",
+        "    m  rename             d  delete (asks to confirm)",
+        "    e  edit in $EDITOR    r / F5  refresh",
+        "",
+        "  View",
+        "    .  toggle hidden files    s  sort by name / size",
+        "    p  toggle preview pane    q / Ctrl-C  quit",
+        "",
+        "  Press any key to close"
+    ];
+    top: i32 = 2;
+    i: i32 = 0;
+    while (i < length(lines) && top + i < g_h - 2) {
+        put(buf, top + i, 0, g_w, lines[i], COLOR_WHITE(), COLOR_BLACK(), ATTR_NONE());
+        i++;
+    }
+}
+
+func drawList(buf: Buffer, leftW: i32) -> void {
+    lh: i32 = listHeight();
+    n: i32 = length(g_entries);
+    if (n == 0) {
+        put(buf, 2, 2, leftW - 3, "(empty directory)", COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_ITALIC());
+        return;
+    }
+    r: i32 = 0;
+    while (r < lh) {
+        idx: i32 = g_scroll + r;
+        if (idx >= n) { break; }
+        e: Entry = g_entries[idx];
+        row: i32 = 2 + r;
+        fg: i32 = COLOR_WHITE();
+        bg: i32 = COLOR_BLACK();
+        attr: i32 = ATTR_NONE();
+        if (e.isDir) { fg = COLOR_BRIGHT_BLUE(); attr = ATTR_BOLD(); }
+        if (idx == g_sel) {
+            fg = COLOR_BLACK();
+            bg = COLOR_CYAN();
+            tuiBufferFill(buf, row, 0, leftW, 1, 32, fg, bg, ATTR_NONE());
+        }
+        label: string = e.name;
+        if (e.isDir) { label = strConcat(label, "/"); }
+        sizeText: string = "";
+        if (!e.isDir) { sizeText = fmtSize(e.size); }
+        sw: i32 = cellLen(sizeText);
+        nameW: i32 = leftW - sw - 4;
+        if (nameW < 4) { nameW = 4; }
+        put(buf, row, 1, nameW, label, fg, bg, attr);
+        if (sw > 0) {
+            put(buf, row, leftW - sw - 1, sw, sizeText, fg, bg, ATTR_NONE());
+        }
+        r++;
+    }
+    if (n > lh) {
+        pos: i32 = (g_scroll * (lh - 1)) / (n - lh);
+        if (pos < 0) { pos = 0; }
+        if (pos > lh - 1) { pos = lh - 1; }
+        tuiBufferSet(buf, 2 + pos, leftW - 1, BLOCK_FULL(), COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_NONE());
+    }
+}
+
+func drawPreview(buf: Buffer, left: i32) -> void {
+    lh: i32 = listHeight();
+    w: i32 = g_w - left - 1;
+    e: Entry = selectedEntry();
+    if (strLength(e.name) == 0) { return; }
+    buildPreview();
+    put(buf, 1, left + 1, w, strConcat(" ", e.name), COLOR_BRIGHT_MAGENTA(), COLOR_BLACK(), ATTR_BOLD());
+    r: i32 = 0;
+    while (r < lh - 0 && r < length(g_prev)) {
+        if (2 + r >= g_h - 2) { break; }
+        put(buf, 2 + r, left + 2, w - 2, g_prev[r], COLOR_WHITE(), COLOR_BLACK(), ATTR_NONE());
+        r++;
+    }
+}
+
+func drawStatus(buf: Buffer) -> void {
+    row: i32 = g_h - 2;
+    fillRow(buf, row, COLOR_WHITE(), COLOR_BLACK(), ATTR_NONE());
+    if (g_mode == 1) {
+        label: string = "Name: ";
+        if (g_promptKind == 3) { label = "Rename to: "; }
+        if (g_promptKind == 1) { label = "New directory: "; }
+        if (g_promptKind == 2) { label = "New file: "; }
+        c: i32 = put(buf, row, 1, g_w - 2, label, COLOR_BRIGHT_YELLOW(), COLOR_BLACK(), ATTR_BOLD());
+        c2: i32 = put(buf, row, 1 + c, g_w - 3 - c, g_input, COLOR_WHITE(), COLOR_BLACK(), ATTR_NONE());
+        tuiBufferSet(buf, row, 1 + c + c2, 32, COLOR_BLACK(), COLOR_WHITE(), ATTR_NONE());
+        return;
+    }
+    if (g_mode == 2) {
+        e: Entry = selectedEntry();
+        msg: string = strConcat(strConcat("Delete '", e.name), "'? (y/N)");
+        if (e.isDir) { msg = strConcat(strConcat("Delete folder '", e.name), "' and everything in it? (y/N)"); }
+        put(buf, row, 1, g_w - 2, msg, COLOR_BRIGHT_RED(), COLOR_BLACK(), ATTR_BOLD());
+        return;
+    }
+    if (strLength(g_msg) > 0) {
+        col: i32 = COLOR_BRIGHT_GREEN();
+        if (g_msgIsErr) { col = COLOR_BRIGHT_RED(); }
+        put(buf, row, 1, g_w - 2, g_msg, col, COLOR_BLACK(), ATTR_NONE());
+        return;
+    }
+    n: i32 = length(g_entries);
+    if (n == 0) { return; }
+    e2: Entry = selectedEntry();
+    info: string = strConcat(strConcat(toString(g_sel + 1), "/"), toString(n));
+    info = strConcat(info, "  ");
+    if (e2.isDir) { info = strConcat(info, "directory"); } else { info = strConcat(info, fmtSize(e2.size)); }
+    info = strConcat(info, "  modified ");
+    info = strConcat(info, fmtDate(fsModTime(fullPath(e2.name))));
+    put(buf, row, 1, g_w - 2, info, COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_NONE());
+}
+
+func draw(buf: Buffer) -> void {
+    tuiBufferClear(buf);
+
+    fillRow(buf, 0, COLOR_BLACK(), COLOR_CYAN(), ATTR_NONE());
+    put(buf, 0, 1, 12, "Risk Explorer", COLOR_BLACK(), COLOR_CYAN(), ATTR_BOLD());
+    pathW: i32 = g_w - 17;
+    shown: string = g_path;
+    over: i32 = cellLen(shown) - pathW;
+    if (over > 0) { shown = strConcat("...", strSubstr(shown, over + 3, strLength(shown))); }
+    put(buf, 0, 16, pathW, shown, COLOR_BLACK(), COLOR_CYAN(), ATTR_NONE());
+
+    leftW: i32 = g_w;
+    showPrev: bool = g_preview && g_w >= 70 && g_mode != 3;
+    if (showPrev) { leftW = (g_w * 55) / 100; }
+
+    fillRow(buf, 1, COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_NONE());
+    sortName: string = "Name";
+    if (g_sort == 1) { sortName = "Name (dirs first, files by size)"; }
+    put(buf, 1, 1, leftW - 2, sortName, COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_UNDERLINE());
+    if (leftW >= 20) { put(buf, 1, leftW - 5, 4, "Size", COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_UNDERLINE()); }
+
+    if (g_mode == 3) {
+        drawHelp(buf);
+    } else {
+        drawList(buf, leftW);
+        if (showPrev) {
+            r: i32 = 1;
+            while (r < g_h - 2) {
+                tuiBufferSet(buf, r, leftW, BOX_V(), COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_NONE());
+                r++;
+            }
+            drawPreview(buf, leftW);
+        }
+    }
+
+    bufRepeatCp(buf, g_h - 3, 0, g_w, BOX_H(), COLOR_BRIGHT_BLACK(), COLOR_BLACK(), ATTR_NONE());
+    drawStatus(buf);
+    fillRow(buf, g_h - 1, COLOR_BLACK(), COLOR_WHITE(), ATTR_NONE());
+    hint: string = "q quit  Enter open  Bksp up  n mkdir  f file  m rename  d delete  e edit  . hidden  s sort  p preview  ? help";
+    put(buf, g_h - 1, 1, g_w - 2, hint, COLOR_BLACK(), COLOR_WHITE(), ATTR_NONE());
+}
+
+func isEnter(key: i32) -> bool { return key == 13 || key == 10; }
+func isBackspace(key: i32) -> bool { return key == 127 || key == 8; }
+
+func handlePrompt(key: i32) -> bool {
+    if (key == KEY_ESCAPE()) { g_mode = 0; setMsg("Cancelled", false); return true; }
+    if (isEnter(key)) { applyPrompt(); return true; }
+    if (isBackspace(key)) {
+        n: i32 = strLength(g_input);
+        if (n > 0) { g_input = strSubstr(g_input, 0, n - 1); }
+        g_dirty = true;
+        return true;
+    }
+    if (key >= 32 && key < 127) {
+        g_input = strConcat(g_input, intToChar(key));
+        g_dirty = true;
+    }
+    return true;
+}
+
+func handleKey(key: i32) -> bool {
+    if (key == KEY_CTRL_C()) { return false; }
+
+    if (g_mode == 1) { return handlePrompt(key); }
+    if (g_mode == 2) {
+        if (key == 121 || key == 89) { doDelete(); } else { g_mode = 0; setMsg("Cancelled", false); }
+        return true;
+    }
+    if (g_mode == 3) { g_mode = 0; g_dirty = true; return true; }
+
+    if (g_msg != "") { g_msg = ""; g_dirty = true; }
+
+    if (key == 113) { return false; }
+
+    if (key == KEY_UP() || key == 107) { moveSel(-1); return true; }
+    if (key == KEY_DOWN() || key == 106) { moveSel(1); return true; }
+    if (key == KEY_PAGE_UP()) { moveSel(-listHeight()); return true; }
+    if (key == KEY_PAGE_DOWN()) { moveSel(listHeight()); return true; }
+    if (key == KEY_HOME() || key == 103) { g_sel = 0; clampSelection(); return true; }
+    if (key == KEY_END() || key == 71) { g_sel = length(g_entries) - 1; clampSelection(); return true; }
+
+    if (isEnter(key) || key == KEY_RIGHT() || key == 108) { openSelected(); return true; }
+    if (key == KEY_LEFT() || isBackspace(key) || key == 104) { goParent(); return true; }
+
+    if (key == 126) { gotoDir(sysEnv("HOME"), ""); return true; }
+    if (key == 46) {
+        g_hidden = !g_hidden;
+        reload(selectedEntry().name);
+        return true;
+    }
+    if (key == 115) {
+        if (g_sort == 0) { g_sort = 1; } else { g_sort = 0; }
+        reload(selectedEntry().name);
+        return true;
+    }
+    if (key == 112) { g_preview = !g_preview; g_dirty = true; return true; }
+    if (key == 114 || key == KEY_F5()) { reload(selectedEntry().name); setMsg("Refreshed", false); return true; }
+    if (key == 110) { startPrompt(1, ""); return true; }
+    if (key == 102) { startPrompt(2, ""); return true; }
+    if (key == 109) {
+        e: Entry = selectedEntry();
+        if (strLength(e.name) > 0) { startPrompt(3, e.name); }
+        return true;
+    }
+    if (key == 100) {
+        if (length(g_entries) > 0) { g_mode = 2; g_dirty = true; }
+        return true;
+    }
+    if (key == 101) { editSelected(); return true; }
+    if (key == 63) { g_mode = 3; g_dirty = true; return true; }
+    return true;
+}
+
+func main() -> i32 {
+    start: string = fsCwd();
+    g_path = pathAbsolute(start);
+    queryTermSize();
+
+    buf: Buffer = tuiBufferNew(g_w, g_h);
+    tuiSetup();
+    reload("");
+
+    running: bool = true;
+    idle: i32 = 0;
+    while (running) {
+        if (kbHit() != 0) {
+            running = handleKey(kbReadKey());
+            idle = 0;
+        } else {
+            timeSleep(20);
+            idle++;
+            if (idle >= 40) {
+                idle = 0;
+                if (queryTermSize()) {
+                    buf = tuiBufferNew(g_w, g_h);
+                    tuiClear();
+                    clampSelection();
+                }
+            }
+        }
+        if (g_dirty && running) {
+            draw(buf);
+            tuiBufferRender(buf);
+            g_dirty = false;
+        }
+    }
+
+    tuiCleanup();
+    return 0;
+}
